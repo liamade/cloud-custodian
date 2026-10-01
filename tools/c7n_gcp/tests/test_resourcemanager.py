@@ -590,6 +590,41 @@ class ProjectTest(BaseTest):
         project_ids = {r['projectId'] for r in resources}
         self.assertNotIn('custodian-test', project_ids)
 
+    def test_project_iam_policy_separation_of_duties(self):
+        """separation-of-duties annotates only members holding a role from both sets."""
+        factory = self.replay_flight_data('project-iam-policy-separation-of-duties')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'gcp.project',
+            'filters': [{
+                'type': 'iam-policy',
+                'separation-of-duties': {
+                    'roles-a': ['roles/cloudkms.admin'],
+                    'roles-b': [
+                        'roles/cloudkms.cryptoKeyEncrypterDecrypter',
+                        'roles/cloudkms.cryptoKeyEncrypter',
+                        'roles/cloudkms.cryptoKeyDecrypter',
+                    ],
+                }
+            }]},
+            session_factory=factory)
+        resources = p.run()
+        conflicts = {r['projectId']: r['c7n:conflicting-iam-bindings'] for r in resources}
+        # custodian-test-2 grants both roles, but to different members.
+        self.assertEqual(sorted(conflicts), ['custodian-test', 'custodian-test-3'])
+        self.assertEqual(conflicts['custodian-test'], [
+            {'role': 'roles/cloudkms.admin', 'member': 'user:alice@example.com'},
+            {'role': 'roles/cloudkms.cryptoKeyDecrypter', 'member': 'user:alice@example.com'},
+        ])
+        # A conditional grant comes back with _withcond_<hash> on the role name.
+        self.assertEqual(conflicts['custodian-test-3'], [
+            {'role': 'roles/cloudkms.admin_withcond_2656b8d6de0f19d2e0a7',
+             'member': 'user:erin@example.com'},
+            {'role': 'roles/cloudkms.cryptoKeyEncrypter', 'member': 'user:erin@example.com'},
+        ])
+        for r in resources:
+            self.assertNotIn('c7n:matched-iam-bindings', r)
+
     def test_compute_meta_filter(self):
         factory = self.replay_flight_data('project-compute-meta')
 

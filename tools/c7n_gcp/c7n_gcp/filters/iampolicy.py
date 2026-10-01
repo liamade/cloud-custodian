@@ -12,6 +12,7 @@ class IamPolicyFilter(Filter):
     """
 
     annotation_key = 'c7n:matched-iam-bindings'
+    conflict_annotation_key = 'c7n:conflicting-iam-bindings'
 
     value_filter_schema = copy.deepcopy(ValueFilter.schema)
     del value_filter_schema['required']
@@ -37,10 +38,21 @@ class IamPolicyFilter(Filter):
         }
     }
 
+    separation_of_duties_schema = {
+        'type': 'object',
+        'additionalProperties': False,
+        'required': ['roles-a', 'roles-b'],
+        'properties': {
+            'roles-a': {'type': 'array', 'items': {'type': 'string'}},
+            'roles-b': {'type': 'array', 'items': {'type': 'string'}},
+        }
+    }
+
     schema = type_schema(
         'iam-policy',
         **{'doc': value_filter_schema,
-        'user-role': user_role_schema})
+        'user-role': user_role_schema,
+        'separation-of-duties': separation_of_duties_schema})
 
     def get_client(self, session, model):
         return session.client(
@@ -70,6 +82,9 @@ class IamPolicyFilter(Filter):
                     {'key': user_spec, 'value': role_spec, 'op': op, 'value_type': 'swap'},
                     self.manager)
                 resources = userRolePairFilter.process(resources)
+        if 'separation-of-duties' in self.data:
+            resources = self._filter_by_separation_of_duties(
+                resources, self.data['separation-of-duties'])
 
         return resources
 
@@ -127,6 +142,61 @@ class IamPolicyFilter(Filter):
                 r[self.annotation_key] = r.get(self.annotation_key, []) + matched_pairs
                 matched_resources.append(r)
             elif not has and not matched_pairs:
+                matched_resources.append(r)
+
+        return matched_resources
+
+    def _filter_by_separation_of_duties(self, resources, spec):
+        """Filter resources where one member holds a role from each of two sets.
+
+        A resource matches when at least one member holds a role in ``roles-a``
+        and a role in ``roles-b``. Matched resources are annotated with
+        ``c7n:conflicting-iam-bindings``, a list of ``{role, member}`` dicts for
+        every conflicting role each such member holds. It is kept apart from
+        ``c7n:matched-iam-bindings`` so ``remove-bindings: matched`` cannot strip
+        both sides of a conflict.
+
+        Conditional grants count. An unversioned ``getIamPolicy`` returns them
+        with ``_withcond_<hash>`` appended to the role name; the suffix is
+        ignored when comparing and kept in the annotation.
+
+        .. code-block:: yaml
+
+            - type: iam-policy
+              separation-of-duties:
+                roles-a:
+                  - roles/cloudkms.admin
+                roles-b:
+                  - roles/cloudkms.cryptoKeyEncrypterDecrypter
+                  - roles/cloudkms.cryptoKeyEncrypter
+                  - roles/cloudkms.cryptoKeyDecrypter
+        """
+        roles_a = set(spec['roles-a'])
+        roles_b = set(spec['roles-b'])
+
+        model = self.manager.get_model()
+        session = local_session(self.manager.session_factory)
+        client = self.get_client(session, model)
+
+        matched_resources = []
+        for r in resources:
+            iam_policy = client.execute_command('getIamPolicy', self._verb_arguments(r))
+
+            roles_by_member = {}
+            for binding in iam_policy.get('bindings', []):
+                for member in binding.get('members', []):
+                    roles_by_member.setdefault(member, []).append(binding['role'])
+
+            conflicts = []
+            for member, roles in roles_by_member.items():
+                held_a = [role for role in roles if role.split('_withcond_')[0] in roles_a]
+                held_b = [role for role in roles if role.split('_withcond_')[0] in roles_b]
+                if held_a and held_b:
+                    conflicts.extend({'role': role, 'member': member} for role in held_a + held_b)
+
+            if conflicts:
+                key = self.conflict_annotation_key
+                r[key] = r.get(key, []) + conflicts
                 matched_resources.append(r)
 
         return matched_resources
