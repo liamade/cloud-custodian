@@ -757,6 +757,7 @@ class SagemakerEndpointMetricsFilter(SageMakerMetricsFilter):
     VariantName = "VariantName"
     ProductionVariants = "ProductionVariants"
     InferenceComponentName = "InferenceComponentName"
+    AsyncInferenceConfig = "AsyncInferenceConfig"
 
     permissions = MetricsFilter.permissions + (
         'sagemaker:ListInferenceComponents',)
@@ -780,6 +781,11 @@ class SagemakerEndpointMetricsFilter(SageMakerMetricsFilter):
     def resource_kind(self, resource) -> Kind:
         """How this endpoint hosts its models.
 
+        An endpoint enabled for asynchronous inference publishes the async
+        invocation metrics in place of the real-time ones, whatever it hosts,
+        so that is decided first. DescribeEndpoint returns its
+        AsyncInferenceConfig, so recognising one costs no call.
+
         An endpoint built to host components but hosting none right now
         is reported classic, which costs nothing: its invocations aren't
         published per variant, and nothing is reserving the instance, so
@@ -788,6 +794,8 @@ class SagemakerEndpointMetricsFilter(SageMakerMetricsFilter):
         execution role and no variant naming a model -- would classify it
         correctly at the price of a DescribeEndpointConfig per endpoint.
         """
+        if self.AsyncInferenceConfig in resource:
+            return 'async'
         if self.endpoint_components.get(resource[self.resource_dimension_name]):
             return 'inference-component'
         return 'classic'

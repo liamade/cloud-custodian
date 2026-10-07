@@ -1,0 +1,8 @@
+{
+    "status_code": 202,
+    "data": {
+        "ResponseMetadata": {},
+        "OutputLocation": "s3://c7n-sagemaker-async-metrics-concrete-crayfish/responses/58d11ef5-ab30-4372-b032-edae2ab0f909.out",
+        "InferenceId": "438a83c4-63d0-48a2-a7b6-61d632dcc940"
+    }
+}

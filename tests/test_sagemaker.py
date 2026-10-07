@@ -8,7 +8,6 @@ from pytest_terraform import terraform
 
 from .common import BaseTest
 
-from c7n.filters.metrics import MetricsFilter
 from c7n.resources.sagemaker import (
     SAGEMAKER_METRICS, SagemakerEndpoint, SagemakerJobQueryParser,
     CompilationJobQueryParser)
@@ -1619,16 +1618,19 @@ def capture_dimensions():
     Flight data is matched on the api call name alone, so asserting on the
     resources a policy returns says nothing about the dimensions it asked
     cloudwatch for -- which is the whole of what these filters do.
+
+    Patched on the endpoint filter, not MetricsFilter: test.patch leaves
+    SageMakerMetricsFilter its own copy, which a patch further up misses.
     """
     dimensions = []
-    get_metric_data = MetricsFilter.get_metric_data
+    klass = SagemakerEndpoint.filter_registry.get('metrics')
+    get_metric_data = klass.get_metric_data
 
     def record(self, client, params):
         dimensions.append(params['Dimensions'])
         return get_metric_data(self, client, params)
 
-    return dimensions, mock.patch.object(
-        MetricsFilter, 'get_metric_data', record)
+    return dimensions, mock.patch.object(klass, 'get_metric_data', record)
 
 ################################################################################
 #
@@ -2112,6 +2114,23 @@ UNEXERCISED_METRICS = frozenset((
     'LoadedModelCount',
     ))
 
+# Metrics the endpoints in tests/terraform/sagemaker_endpoint_async_metrics
+# don't produce. Neither has a GPU, and every request they're sent succeeds:
+# an async endpoint publishes its error counts only for errors, has no
+# notification configuration to fail, and nothing outlives its TTL.
+UNEXERCISED_ASYNC_METRICS = frozenset((
+    'GPUMemoryUtilization',
+    'GPUUtilization',
+    'Invocation4XXErrors',
+    'Invocation5XXErrors',
+    'NotificationFailures',
+    'ExpiredRequests',
+    ))
+
+# What DescribeEndpoint reports for an endpoint enabled for asynchronous
+# inference, and all the filter needs to know it is one
+ASYNC_INFERENCE_CONFIG = {'OutputConfig': {'S3OutputPath': 's3://a-bucket/output'}}
+
 
 def sagemaker_endpoint_metric_entries():
     """Every (kind, metric) the catalogue describes for endpoints.
@@ -2127,14 +2146,15 @@ def sagemaker_endpoint_metric_entries():
         ]
 
 
-def sagemaker_endpoint_metric_entries_published():
-    """The entries these endpoints can be recorded against."""
+def sagemaker_endpoint_metric_entries_published(kinds, unexercised):
+    """The entries of these kinds a fixture's endpoints can be recorded against."""
     return [
-        entry if entry.values[1] not in UNEXERCISED_METRICS else
+        entry if entry.values[1] not in unexercised else
         pytest.param(*entry.values, id=entry.id,
                      marks=pytest.mark.skip(
                          reason='not produced by these endpoints'))
         for entry in sagemaker_endpoint_metric_entries()
+        if entry.values[0] in kinds
         ]
 
 
@@ -2153,6 +2173,8 @@ def test_sagemaker_endpoint_metric_entry(test, kind, metric, published):
 
     endpoint = {'EndpointName': 'e',
                 'ProductionVariants': [{'VariantName': 'AllTraffic'}]}
+    if kind == 'async':
+        endpoint['AsyncInferenceConfig'] = ASYNC_INFERENCE_CONFIG
     f.endpoint_components = (
         {'e': ['component']} if kind == 'inference-component' else {})
     assert f.resource_kind(endpoint) == kind
@@ -2168,10 +2190,45 @@ def test_sagemaker_endpoint_metric_entry(test, kind, metric, published):
                for value in dimensions.values())
 
 
+def test_sagemaker_endpoint_metrics_async_kept_apart(test):
+    # an async endpoint publishes none of the real-time endpoint metrics but
+    # the few they share, and a real-time endpoint none of the async ones,
+    # so neither is asked for the other's: it has nothing to measure, and
+    # the missing value decides it
+    policy = test.load_policy(
+        {'name': 'endpoints', 'resource': 'sagemaker-endpoint'})
+    klass = SagemakerEndpoint.filter_registry.get('metrics')
+    variants = [{'VariantName': 'AllTraffic'}]
+    async_endpoint = {'EndpointName': 'a', 'ProductionVariants': variants,
+                      'AsyncInferenceConfig': ASYNC_INFERENCE_CONFIG}
+    classic_endpoint = {'EndpointName': 'c', 'ProductionVariants': variants}
+
+    def dimensions_set(metric, endpoint):
+        f = klass({'type': 'metrics', 'name': metric, 'value': 0},
+                  policy.resource_manager)
+        f.endpoint_components = {}
+        return f.get_dimensions_set(endpoint)
+
+    classic = SAGEMAKER_METRICS['classic']['sagemaker-endpoint'].keys()
+    async_ = SAGEMAKER_METRICS['async']['sagemaker-endpoint'].keys()
+    assert 'Invocations' in classic - async_
+    assert 'InvocationsProcessed' in async_ - classic
+    for metric in classic - async_:
+        assert dimensions_set(metric, async_endpoint) == [], metric
+    for metric in async_ - classic:
+        assert dimensions_set(metric, classic_endpoint) == [], metric
+
+    # the ones they share are asked of both
+    assert dimensions_set('ModelLatency', async_endpoint) == [
+        {'EndpointName': 'a', 'VariantName': 'AllTraffic'}]
+    assert dimensions_set('ModelLatency', classic_endpoint) == [
+        {'EndpointName': 'c', 'VariantName': 'AllTraffic'}]
+
+
 # Metrics publish a minute or so after an invocation, and one publication
-# window serves every case below, so the traffic is generated once for the
-# whole module rather than per test.
-INVOKED: list[str] = []
+# window serves every case below, so the traffic is generated once per
+# fixture for the whole module rather than per test.
+INVOKED: set[str] = set()
 
 # variants and components of the endpoints tests/terraform/
 # sagemaker_endpoint_metrics builds. "quiet" is deliberately left silent.
@@ -2181,9 +2238,9 @@ ENDPOINT_VARIANTS = {'busy': ('quiet', 'busy', 'gpu'),
 
 def invoke_for_metrics(test, factory, endpoints, components):
     """Give every endpoint something to report, once per recording run."""
-    if not test.recording or INVOKED:
+    if not test.recording or 'sagemaker_endpoint_metrics' in INVOKED:
         return
-    INVOKED.append('done')
+    INVOKED.add('sagemaker_endpoint_metrics')
 
     runtime = factory().client('sagemaker-runtime')
     for name, endpoint in endpoints.items():
@@ -2203,7 +2260,9 @@ def invoke_for_metrics(test, factory, endpoints, components):
 
 @pytest.mark.audited
 @pytest.mark.parametrize('kind,metric,published',
-                         sagemaker_endpoint_metric_entries_published())
+                         sagemaker_endpoint_metric_entries_published(
+                             ('classic', 'inference-component'),
+                             UNEXERCISED_METRICS))
 @terraform('sagemaker_endpoint_metrics', scope='module')
 def test_sagemaker_endpoint_metric_published(
         test, sagemaker_endpoint_metrics, kind, metric, published):
@@ -2227,7 +2286,11 @@ def test_sagemaker_endpoint_metric_published(
         'ProductionVariants': [{'VariantName': variant}
                                for variant in ENDPOINT_VARIANTS[hosting]],
         }
+    assert_metric_published(test, factory, kind, metric, resource, components)
 
+
+def assert_metric_published(test, factory, kind, metric, resource, components):
+    """Every dimension set the metric is filed under has a series for resource."""
     p = test.load_policy(
         {'name': 'sagemaker-endpoint-metric',
          'resource': 'sagemaker-endpoint',
@@ -2251,3 +2314,96 @@ def test_sagemaker_endpoint_metric_published(
     assert len(series) == len(f.get_dimensions_set(resource))
     assert any(points for points in series.values()), (
         f"{metric} returned no data for any {kind} dimension set")
+
+
+################################################################################
+#
+# Asynchronous inference endpoints, which have a fixture of their own:
+# tests/terraform/sagemaker_endpoint_async_metrics.
+#
+
+
+def invoke_async_for_metrics(test, factory, endpoint, request):
+    """Give the busy async endpoint something to report, once per recording run.
+
+    An async request isn't sent with the call: the endpoint fetches it from
+    S3, and writes its response back there.
+    """
+    if not test.recording or 'sagemaker_endpoint_async_metrics' in INVOKED:
+        return
+    INVOKED.add('sagemaker_endpoint_async_metrics')
+
+    runtime = factory().client('sagemaker-runtime')
+    for _ in range(5):
+        runtime.invoke_endpoint_async(
+            EndpointName=endpoint, ContentType='text/csv', InputLocation=request)
+    time.sleep(300)
+
+
+@pytest.mark.audited
+@terraform('sagemaker_endpoint_async_metrics', scope='module')
+def test_sagemaker_endpoint_async_metrics_idle(
+        test, sagemaker_endpoint_async_metrics):
+    # the idle endpoint has never processed a request, so it has no series
+    # at all and only a missing value can decide it
+    busy = sagemaker_endpoint_async_metrics['aws_sagemaker_endpoint.busy.name']
+    idle = sagemaker_endpoint_async_metrics['aws_sagemaker_endpoint.idle.name']
+    request = sagemaker_endpoint_async_metrics.outputs['request_location']['value']
+    factory = test.replay_flight_data('test_sagemaker_endpoint_async_metrics_idle')
+    invoke_async_for_metrics(test, factory, busy, request)
+
+    idle_policy = {
+        'name': 'sagemaker-endpoints-idle',
+        'resource': 'sagemaker-endpoint',
+        'filters': [
+            {'type': 'value', 'key': 'EndpointName',
+             'op': 'in', 'value': [busy, idle]},
+            {'type': 'metrics',
+             'name': 'InvocationsProcessed',
+             'statistics': 'Sum',
+             'days': 1,
+             'period': 86400,
+             'value': 0,
+             'op': 'lte'},
+            ],
+        }
+    # without a missing value the idle endpoint is passed over, and the busy
+    # one has processed requests
+    p = test.load_policy(idle_policy, session_factory=factory)
+    assert p.run() == []
+
+    idle_policy['filters'][1]['missing-value'] = 0
+    p = test.load_policy(idle_policy, session_factory=factory)
+    dimensions, capture = capture_dimensions()
+    with capture:
+        [resource] = p.run()
+    assert resource['EndpointName'] == idle
+    [points] = resource['c7n.metrics'].values()
+    assert points == []
+    assert sorted([(d['Name'], d['Value']) for d in dims] for dims in dimensions) == [
+        [('EndpointName', busy), ('VariantName', 'AllTraffic')],
+        [('EndpointName', idle), ('VariantName', 'AllTraffic')]]
+
+
+@pytest.mark.audited
+@pytest.mark.parametrize('kind,metric,published',
+                         sagemaker_endpoint_metric_entries_published(
+                             ('async',), UNEXERCISED_ASYNC_METRICS))
+@terraform('sagemaker_endpoint_async_metrics', scope='module')
+def test_sagemaker_endpoint_async_metric_published(
+        test, sagemaker_endpoint_async_metrics, kind, metric, published):
+    # test_sagemaker_endpoint_metric_published, for the async endpoints
+    busy = sagemaker_endpoint_async_metrics['aws_sagemaker_endpoint.busy.name']
+    request = sagemaker_endpoint_async_metrics.outputs['request_location']['value']
+    factory = test.replay_flight_data(f"test_sagemaker_metric_async_{metric}")
+    invoke_async_for_metrics(test, factory, busy, request)
+
+    resource = {
+        'EndpointName': busy,
+        'ProductionVariants': [{'VariantName': 'AllTraffic'}],
+        'AsyncInferenceConfig': ASYNC_INFERENCE_CONFIG,
+        }
+    assert_metric_published(test, factory, kind, metric, resource, {})
+
+#
+################################################################################

@@ -14,6 +14,10 @@ for the account they live in:
     terraform apply
     AWS_DEFAULT_REGION=us-east-1 uv run tests/terraform/sagemaker_endpoint_metrics/probe_metrics.py
 
+The asynchronous inference endpoints are in a module of their own,
+../sagemaker_endpoint_async_metrics. Their names share this module's
+prefix, so the probe finds whichever of the two modules is applied.
+
 Everything goes to standard output. Use --no-invoke to skip generating
 traffic when the endpoints have been invoked within the metric window.
 
@@ -50,8 +54,13 @@ So, for dimensions:
 
 And for `kind`, `classic` means a model is attached to each
 production variant, `inference-component` means the configuration carries an
-execution role and models arrive as components. A section's metrics belong
-to the kinds this script saw publishing them.
+execution role and models arrive as components, and `async` means the
+endpoint carries an AsyncInferenceConfig. A section's metrics belong to the
+kinds this script saw publishing them.
+
+The async metrics are documented on a page of their own:
+
+    https://docs.aws.amazon.com/sagemaker/latest/dg/async-inference-monitor.html
 
 The script cannot see everything. It reports which catalogue entries it
 could not check -- metrics no endpoint here publishes, such as the GPU
@@ -86,9 +95,12 @@ NAMESPACES = (
 def endpoint_kind(sagemaker, endpoint: dict) -> str:
     """Which way this endpoint hosts its models.
 
-    The rule the SageMaker SDK uses: an execution role on the
-    configuration and no production variant naming a model.
+    An async endpoint says so on the endpoint itself. Otherwise, the rule
+    the SageMaker SDK uses: an execution role on the configuration and no
+    production variant naming a model.
     """
+    if 'AsyncInferenceConfig' in endpoint:
+        return 'async'
     config = sagemaker.describe_endpoint_config(
         EndpointConfigName=endpoint['EndpointConfigName'])
     if config.get('ExecutionRoleArn') and not any(
@@ -122,14 +134,36 @@ def find_components(sagemaker, endpoints: list[dict]) -> dict[str, list[str]]:
     return components
 
 
-def invoke(runtime, endpoints, components, count: int) -> None:
-    """Invoke one variant of each classic endpoint, and each component.
+def async_request(s3, endpoint: dict) -> str:
+    """Put a request where an async endpoint can fetch it, and say where.
+
+    The endpoint fetches its requests from S3 rather than taking them with
+    the call. Its role can write the bucket its responses go to, so it can
+    read that one too.
+    """
+    output = endpoint['AsyncInferenceConfig']['OutputConfig']['S3OutputPath']
+    bucket = output.removeprefix('s3://').split('/', 1)[0]
+    s3.put_object(Bucket=bucket, Key='probe-request.csv', Body=b'0.5\n')
+    return f"s3://{bucket}/probe-request.csv"
+
+
+def invoke(runtime, s3, endpoints, components, count: int) -> None:
+    """Invoke one variant of each classic endpoint, each component, and
+    each async endpoint.
 
     A variant named "quiet" is left alone: a variant that is never invoked
     still publishes zeros, which is worth seeing.
     """
     for endpoint in endpoints:
         name = endpoint['EndpointName']
+        if endpoint['kind'] == 'async':
+            request = async_request(s3, endpoint)
+            for _ in range(count):
+                runtime.invoke_endpoint_async(
+                    EndpointName=name, ContentType='text/csv',
+                    InputLocation=request)
+            print(f"  invoked {name} {count}x asynchronously")
+            continue
         targets = [
             dict(InferenceComponentName=component)
             for component in components.get(name, ())
@@ -169,6 +203,8 @@ def observed(cloudwatch, names: set[str]) -> dict:
 
 def fill(name_set: list[str], endpoint: dict, component: str | None) -> list[list[dict]]:
     """The dimensions to query for one resource, or [] if we can't supply them."""
+    if name_set == ['EndpointName']:
+        return [[{'Name': 'EndpointName', 'Value': endpoint['EndpointName']}]]
     if name_set == ['EndpointName', 'VariantName']:
         return [
             [{'Name': 'EndpointName', 'Value': endpoint['EndpointName']},
@@ -218,8 +254,8 @@ def main() -> None:
 
     if not args.no_invoke:
         print('\nInvoking')
-        invoke(boto3.client('sagemaker-runtime'), endpoints, components,
-               args.count)
+        invoke(boto3.client('sagemaker-runtime'), boto3.client('s3'),
+               endpoints, components, args.count)
         print(f"  waiting {args.wait}s for publication")
         time.sleep(args.wait)
 
